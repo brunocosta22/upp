@@ -14,7 +14,6 @@ import serial
 import smpclient.requests.image_management as img
 import smpclient.requests.os_management as os_mgmt
 from smpclient import SMPClient
-from smpclient.transport.ble import SMPBLETransport
 from smpclient.transport.serial import SMPSerialTransport
 
 
@@ -190,19 +189,13 @@ async def run(args: argparse.Namespace) -> None:
         try:
             images = expand_firmware(Path(args.firmware), temp_dir, args.image)
 
-            if args.transport == "serial-recovery":
-                if not args.no_reboot:
-                    send_serial_recovery_reboot(args.port, args.baud, args.wait)
-                transport = SMPSerialTransport(baudrate=args.baud)
-                address = args.port
-                mark_pending = args.mark_pending
-            else:
-                transport = SMPBLETransport()
-                address = args.address
-                mark_pending = True
+            if not args.no_reboot:
+                send_serial_recovery_reboot(args.port, args.baud, args.wait)
 
-            async with SMPClient(transport, address, timeout_s=args.timeout) as client:
-                await upload_images(client, images, mark_pending=mark_pending)
+            transport = SMPSerialTransport(baudrate=args.baud)
+
+            async with SMPClient(transport, args.port, timeout_s=args.timeout) as client:
+                await upload_images(client, images, mark_pending=args.mark_pending)
         finally:
             temp_dir.cleanup()
 
@@ -210,22 +203,15 @@ async def run(args: argparse.Namespace) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Upload DK firmware using MCUmgr SMP.")
+    parser = argparse.ArgumentParser(description="Upload CCPL DK firmware using MCUmgr SMP.")
     parser.add_argument(
         "firmware",
         nargs="?",
         default=str(DEFAULT_FIRMWARE),
         help=f"DFU zip or signed bin. Default: {DEFAULT_FIRMWARE}",
     )
-    parser.add_argument(
-        "--transport",
-        choices=("serial-recovery", "ble"),
-        default="serial-recovery",
-        help="serial-recovery enters MCUboot first; ble uploads to the running app.",
-    )
-    parser.add_argument("--port", default=DEFAULT_SERIAL_PORT, help="Serial device for serial-recovery mode.")
+    parser.add_argument("--port", default=DEFAULT_SERIAL_PORT, help="Serial device for MCUboot serial recovery.")
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUD_RATE, help="Serial baud rate.")
-    parser.add_argument("--address", help="BLE address/name for ble mode.")
     parser.add_argument("--wait", type=float, default=5.0, help="Seconds to wait after serial recovery reboot.")
     parser.add_argument("--timeout", type=float, default=10.0, help="SMP request timeout in seconds.")
     parser.add_argument(
@@ -240,12 +226,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Mark uploaded image pending in serial-recovery mode before reset.",
     )
-    args = parser.parse_args()
-
-    if args.transport == "ble" and not args.address:
-        parser.error("--address is required with --transport ble")
-
-    return args
+    return parser.parse_args()
 
 
 def main() -> None:
@@ -261,3 +242,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    
