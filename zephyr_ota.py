@@ -47,8 +47,8 @@ SERIAL_RECOVERY_REBOOT_CMD = bytes(
         0x02,
         0x18,
         0x03,
-        0x20,
-        0x72,
+        0x64,
+        0x4E,
         0x5A,
         0x5A,
     ]
@@ -62,8 +62,29 @@ class FirmwareImage:
     name: str
 
 
+def zephyr_crc16_ccitt(data: bytes, seed: int = 0) -> int:
+    for byte in data:
+        e = (seed ^ byte) & 0xFF
+        f = (e ^ ((e << 4) & 0xFF)) & 0xFF
+        seed = ((seed >> 8) ^ (f << 8) ^ (f << 3) ^ (f >> 4)) & 0xFFFF
+
+    return seed
+
+
+def validate_serial_frame_crc(frame: bytes) -> None:
+    payload_len = (frame[12] << 8) | frame[13]
+    payload = frame[14 : 14 + payload_len]
+    received_crc = (frame[14 + payload_len] << 8) | frame[15 + payload_len]
+    calculated_crc = zephyr_crc16_ccitt(payload)
+
+    if received_crc != calculated_crc:
+        raise ValueError(f"reboot frame CRC mismatch: got 0x{received_crc:04X}, expected 0x{calculated_crc:04X}")
+
+
 def send_serial_recovery_reboot(port: str, baud: int, wait_s: float) -> None:
     print(f"Requesting MCUboot serial recovery on {port}...")
+    validate_serial_frame_crc(SERIAL_RECOVERY_REBOOT_CMD)
+
     with serial.Serial(port, baud, timeout=2) as serial_port:
         serial_port.reset_input_buffer()
         serial_port.reset_output_buffer()
@@ -242,4 +263,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    
