@@ -1,91 +1,263 @@
+#!/usr/bin/env python3
+
+import argparse
 import asyncio
+import json
 import sys
-import serial
+import tempfile
 import time
-from smpclient import SMPClient
-from smpclient.transport.serial import SMPSerialTransport
+import zipfile
+from dataclasses import dataclass
+from pathlib import Path
+
+import serial
 import smpclient.requests.image_management as img
 import smpclient.requests.os_management as os_mgmt
+from smpclient import SMPClient
+from smpclient.transport.ble import SMPBLETransport
+from smpclient.transport.serial import SMPSerialTransport
 
-SERIAL_PORT = "/dev/ttymxc2"
-BAUD_RATE   = 115200
-FIRMWARE    = sys.argv[1] if len(sys.argv) > 1 else "zephyr.signed.bin"
 
-# Raw FOTA reboot command to enter MCUboot retain boot mode
-FOTA_REBOOT_CMD = bytes([
-    0xa5, 0xa5, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x01, 0x00, 0x00, 0x08, 0x12, 0x06,
-    0x08, 0x7b, 0x10, 0x02, 0x18, 0x04, 0x50, 0x95,
-    0x5a, 0x5a
-])
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_FIRMWARE = REPO_ROOT / "build" / "ccpl_dk" / "zephyr" / "dk_app.signed.bin"
+DEFAULT_SERIAL_PORT = "/dev/ttymxc2"
+DEFAULT_BAUD_RATE = 115200
 
-def send_fota_reboot(port: str, baud: int, wait_s: float = 3.0):
-    """Send raw FOTA reboot frame and wait for device to enter MCUboot."""
-    print(f"Sending FOTA reboot command to {port}...")
-    with serial.Serial(port, baud, timeout=2) as s:
-        s.reset_input_buffer()
-        s.reset_output_buffer()
-        s.write(FOTA_REBOOT_CMD)
-        s.flush()
-        print(f"  Sent {len(FOTA_REBOOT_CMD)} bytes: {FOTA_REBOOT_CMD.hex(' ').upper()}")
+# DK_CMD_REBOOT (cmd=3): request MCUboot serial recovery via retention boot mode.
+SERIAL_RECOVERY_REBOOT_CMD = bytes(
+    [
+        0xA5,
+        0xA5,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x01,
+        0x00,
+        0x00,
+        0x08,
+        0x12,
+        0x06,
+        0x08,
+        0x7B,
+        0x10,
+        0x02,
+        0x18,
+        0x03,
+        0x20,
+        0x72,
+        0x5A,
+        0x5A,
+    ]
+)
 
-    print(f"  Waiting {wait_s}s for device to reboot into MCUboot...")
+
+@dataclass(frozen=True)
+class FirmwareImage:
+    path: Path
+    image_index: int
+    name: str
+
+
+def send_serial_recovery_reboot(port: str, baud: int, wait_s: float) -> None:
+    print(f"Requesting MCUboot serial recovery on {port}...")
+    with serial.Serial(port, baud, timeout=2) as serial_port:
+        serial_port.reset_input_buffer()
+        serial_port.reset_output_buffer()
+        serial_port.write(SERIAL_RECOVERY_REBOOT_CMD)
+        serial_port.flush()
+        print(f"  Sent {len(SERIAL_RECOVERY_REBOOT_CMD)} bytes")
+
+    print(f"  Waiting {wait_s:.1f}s for MCUboot...")
     time.sleep(wait_s)
-    print("  Device should now be in MCUboot retain boot mode.\n")
 
-async def upload_firmware():
-    transport = SMPSerialTransport()
 
-    async with SMPClient(transport, SERIAL_PORT, BAUD_RATE) as client:
+def infer_image_index(firmware: Path, image: str) -> int:
+    if image == "app":
+        return 0
+    if image == "net":
+        return 1
 
-        # 1. Read current image state
+    name = firmware.name.lower()
+    if "net" in name or "ipc_radio" in name or "cpunet" in name:
+        return 1
+
+    return 0
+
+
+def expand_firmware(firmware: Path, temp_dir: tempfile.TemporaryDirectory, image: str) -> list[FirmwareImage]:
+    firmware = firmware.expanduser().resolve()
+    if not firmware.exists():
+        raise FileNotFoundError(f"Firmware file not found: {firmware}")
+
+    if firmware.suffix.lower() != ".zip":
+        return [FirmwareImage(path=firmware, image_index=infer_image_index(firmware, image), name=firmware.name)]
+
+    extract_dir = Path(temp_dir.name)
+    with zipfile.ZipFile(firmware) as archive:
+        manifest = json.loads(archive.read("manifest.json"))
+        archive.extractall(extract_dir)
+
+    images: list[FirmwareImage] = []
+    for entry in manifest.get("files", []):
+        file_name = entry["file"]
+        image_index = int(entry.get("image_index", 0))
+        images.append(
+            FirmwareImage(
+                path=extract_dir / file_name,
+                image_index=image_index,
+                name=file_name,
+            )
+        )
+
+    if not images:
+        raise ValueError(f"No images found in DFU manifest: {firmware}")
+
+    return images
+
+
+def print_image_states(response) -> None:
+    for image_state in response.images:
+        image = getattr(image_state, "image", 0)
+        slot = getattr(image_state, "slot", "?")
+        version = getattr(image_state, "version", "?")
+        active = getattr(image_state, "active", False)
+        confirmed = getattr(image_state, "confirmed", False)
+        pending = getattr(image_state, "pending", False)
+        print(
+            f"  image={image} slot={slot} version={version} "
+            f"active={active} confirmed={confirmed} pending={pending}"
+        )
+
+
+async def upload_images(client: SMPClient, images: list[FirmwareImage], mark_pending: bool) -> None:
+    try:
         print("Reading image slots...")
-        r = await client.request(img.ImageStatesRead())
-        for image in r.images:
-            print(f"  Slot {image.slot}: {image.version} "
-                  f"active={image.active} confirmed={image.confirmed}")
+        print_image_states(await client.request(img.ImageStatesRead()))
+    except Exception as exc:
+        print(f"  Image state read skipped: {exc}")
 
-        # 2. Upload firmware
-        print(f"\nUploading {FIRMWARE}...")
-        with open(FIRMWARE, "rb") as f:
-            firmware_data = f.read()
-        print(f"  Firmware size: {len(firmware_data)} bytes")
+    uploaded_hashes: list[bytes] = []
+    for firmware_image in images:
+        firmware_data = firmware_image.path.read_bytes()
+        print(
+            f"\nUploading {firmware_image.name} "
+            f"(image={firmware_image.image_index}, {len(firmware_data)} bytes)..."
+        )
 
-        async for offset in client.upload(firmware_data):
-            pct = offset / len(firmware_data) * 100
-            bar = '#' * int(pct // 5) + '-' * (20 - int(pct // 5))
+        async for offset in client.upload(firmware_data, slot=firmware_image.image_index):
+            pct = 100.0 if not firmware_data else offset / len(firmware_data) * 100.0
+            bar = "#" * int(pct // 5) + "-" * (20 - int(pct // 5))
             print(f"  [{bar}] {pct:.1f}% ({offset}/{len(firmware_data)} bytes)", end="\r")
-        print(f"\n  Upload complete.")
+        print("\n  Upload complete.")
 
-        # 3. Get hash of uploaded image (slot 1)
-        r = await client.request(img.ImageStatesRead())
-        slot1 = next((i for i in r.images if i.slot == 1), None)
-        if not slot1:
-            print("Error: image not found in slot 1 after upload")
-            return
-        print(f"  Uploaded image hash: {slot1.hash.hex()}")
+    try:
+        print("\nReading uploaded image states...")
+        state_response = await client.request(img.ImageStatesRead())
+        print_image_states(state_response)
 
-        # 4. Mark image for next boot (test mode)
-        print("\nSetting image for next boot (test)...")
-        r = await client.request(img.ImageStatesWrite(hash=slot1.hash))
+        for image_state in state_response.images:
+            if getattr(image_state, "active", False):
+                continue
+            image_hash = getattr(image_state, "hash", None)
+            if image_hash:
+                uploaded_hashes.append(image_hash)
+    except Exception as exc:
+        if mark_pending:
+            raise
+        print(f"  Image state read skipped: {exc}")
 
-        # 5. Reset via SMP
-        print("Resetting device via SMP...")
-        await client.request(os_mgmt.ResetWrite())
+    if mark_pending:
+        if not uploaded_hashes:
+            raise RuntimeError("No non-active uploaded image hash found to mark pending")
 
-        print("\nDone! Device rebooting into new firmware.")
-        print("If it boots successfully, run confirm to make it permanent.")
+        # MCUboot accepts one hash per request. For nRF53 multi-image builds, the
+        # image-management hook links the app and net-core updates.
+        print("\nMarking uploaded image for next boot...")
+        await client.request(img.ImageStatesWrite(hash=uploaded_hashes[0]))
 
-def main():
-    if not FIRMWARE:
-        print("Usage: python3 zephyr_ota.py <firmware.signed.bin>")
+    print("Resetting device via SMP...")
+    await client.request(os_mgmt.ResetWrite())
+
+
+async def run(args: argparse.Namespace) -> None:
+    with tempfile.TemporaryDirectory(prefix="ccpl-dfu-") as temp_dir_path:
+        temp_dir = tempfile.TemporaryDirectory(prefix="work-", dir=temp_dir_path)
+        try:
+            images = expand_firmware(Path(args.firmware), temp_dir, args.image)
+
+            if args.transport == "serial-recovery":
+                if not args.no_reboot:
+                    send_serial_recovery_reboot(args.port, args.baud, args.wait)
+                transport = SMPSerialTransport(baudrate=args.baud)
+                address = args.port
+                mark_pending = args.mark_pending
+            else:
+                transport = SMPBLETransport()
+                address = args.address
+                mark_pending = True
+
+            async with SMPClient(transport, address, timeout_s=args.timeout) as client:
+                await upload_images(client, images, mark_pending=mark_pending)
+        finally:
+            temp_dir.cleanup()
+
+    print("\nDone.")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Upload DK firmware using MCUmgr SMP.")
+    parser.add_argument(
+        "firmware",
+        nargs="?",
+        default=str(DEFAULT_FIRMWARE),
+        help=f"DFU zip or signed bin. Default: {DEFAULT_FIRMWARE}",
+    )
+    parser.add_argument(
+        "--transport",
+        choices=("serial-recovery", "ble"),
+        default="serial-recovery",
+        help="serial-recovery enters MCUboot first; ble uploads to the running app.",
+    )
+    parser.add_argument("--port", default=DEFAULT_SERIAL_PORT, help="Serial device for serial-recovery mode.")
+    parser.add_argument("--baud", type=int, default=DEFAULT_BAUD_RATE, help="Serial baud rate.")
+    parser.add_argument("--address", help="BLE address/name for ble mode.")
+    parser.add_argument("--wait", type=float, default=5.0, help="Seconds to wait after serial recovery reboot.")
+    parser.add_argument("--timeout", type=float, default=10.0, help="SMP request timeout in seconds.")
+    parser.add_argument(
+        "--image",
+        choices=("auto", "app", "net"),
+        default="auto",
+        help="Image index for raw .bin files: app=0, net=1. ZIP manifests ignore this.",
+    )
+    parser.add_argument("--no-reboot", action="store_true", help="Do not send the serial recovery reboot frame first.")
+    parser.add_argument(
+        "--mark-pending",
+        action="store_true",
+        help="Mark uploaded image pending in serial-recovery mode before reset.",
+    )
+    args = parser.parse_args()
+
+    if args.transport == "ble" and not args.address:
+        parser.error("--address is required with --transport ble")
+
+    return args
+
+
+def main() -> None:
+    try:
+        asyncio.run(run(parse_args()))
+    except KeyboardInterrupt:
+        print("\nInterrupted", file=sys.stderr)
+        sys.exit(130)
+    except Exception as exc:
+        print(f"\nERROR: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    # Step 1: send raw reboot frame → enters MCUboot retain mode
-    send_fota_reboot(SERIAL_PORT, BAUD_RATE, wait_s=3.0)
-
-    # Step 2: upload firmware via SMP
-    asyncio.run(upload_firmware())
 
 if __name__ == "__main__":
     main()
